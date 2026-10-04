@@ -17,7 +17,7 @@ optdepends=(
     'rkhunter: Security audit and tool definition updates'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('2822ba361353a2e3b4f4a5feffc5a7762f7d86b02b87001fb36dcc3f5b96fe5f')
 
 package() {
     cd "$srcdir/UpdateArch-$pkgver" 2>/dev/null || cd "$startdir"
