@@ -70,15 +70,21 @@ sudo pacman -S --needed python python-pyqt6 pacman-contrib needrestart
 
 ## 🚀 Instalação
 
-### Opção 1: Via PKGBUILD (Recomendado)
-Clone o repositório e compile localmente:
+### Opção 1: Pacote Pré-compilado (Instalação Direta via Pacman)
+Instale diretamente a versão estável empacotada sem necessidade de compilação ou conta no AUR:
+```bash
+sudo pacman -U https://github.com/madhyn/UpdateArch/releases/download/v1.0.0/updatearch-1.0.0-1-any.pkg.tar.zst
+```
+
+### Opção 2: Compilação via PKGBUILD Local
+Clone o repositório e compile o pacote nativo com o gerenciador oficial do Arch:
 ```bash
 git clone https://github.com/madhyn/UpdateArch.git
 cd UpdateArch
 makepkg -si
 ```
 
-### Opção 2: Instalação Manual (Usuário Local)
+### Opção 3: Instalação Manual (Usuário Local)
 Caso prefira rodar sem instalar no sistema raiz:
 ```bash
 git clone https://github.com/madhyn/UpdateArch.git
