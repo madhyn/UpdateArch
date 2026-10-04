@@ -1,0 +1,1240 @@
+#!/usr/bin/env python3
+"""
+UpdateArch — Autonomous System Tray & Update Guard for Arch Linux
+Author: madhyn (https://github.com/madhyn/UpdateArch)
+License: MIT
+
+Lightweight, non-intrusive Arch Linux update manager and reboot diagnostics
+tool with native StatusNotifierItem (SNI / DBusMenu) integration for KDE Plasma
+and modern Wayland / X11 compositors.
+"""
+
+import sys
+import os
+import pty
+import select
+import subprocess
+import shutil
+import re
+import glob
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QPlainTextEdit, QCheckBox, QMessageBox,
+    QSystemTrayIcon, QMenu, QSplitter, QListWidget, QListWidgetItem
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QSize
+from PyQt6.QtGui import QFont, QColor, QTextCursor, QIcon, QPixmap, QPainter, QPen, QCursor
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
+# ----------------------------------------------------------------------
+# Constantes Visuais (Paleta Dark Minimalista & Acentos Arch Linux)
+# ----------------------------------------------------------------------
+BG_COLOR = "#0d1117"
+PANEL_COLOR = "#161b22"
+BORDER_COLOR = "#30363d"
+TEXT_COLOR = "#c9d1d9"
+TEXT_MUTED = "#8b949e"
+
+COLOR_ARCH_BLUE = "#1793d1"
+COLOR_ARCH_HOVER = "#007acc"
+COLOR_CYAN = "#0284c7"
+COLOR_GREEN = "#2ea043"
+COLOR_GREEN_BG = "#13341d"
+COLOR_YELLOW = "#d29922"
+COLOR_YELLOW_BG = "#3e2e04"
+COLOR_RED = "#f85149"
+COLOR_RED_BG = "#3d1314"
+
+
+def clean_ansi(text: str) -> str:
+    """Remove sequências de controle ANSI, OSC e tokens de sessão systemd."""
+    # Remove sequências OSC (Operating System Command): ESC ] ... (BEL ou ESC \)
+    text = re.sub(r'\x1B\][^\x07\x1b]*(?:\x07|\x1b\\)?', '', text)
+    # Remove sequências CSI padrão: ESC [ ...
+    text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+    # Remove tokens de integração de terminal/audit do systemd
+    text = re.sub(r'3008;(?:start|end)=[a-f0-9]+[^\n]*\n?', '', text)
+    lines = text.split('\n')
+    processed = []
+    for line in lines:
+        if '\r' in line:
+            parts = [p for p in line.split('\r') if p]
+            candidate = parts[-1] if parts else ''
+        else:
+            candidate = line
+        stripped = candidate.strip()
+        # Ignora avisos cosméticos comuns que poluem o log
+        if re.match(r'^(?:e?grep: (?:warning|aviso):|WARNING: Clamd was NOT notified)', stripped):
+            continue
+        processed.append(candidate)
+    return '\n'.join(processed)
+
+
+# ----------------------------------------------------------------------
+# Thread para Execução Assíncrona e Leitura em Tempo Real via PTY
+# ----------------------------------------------------------------------
+class UpdateWorker(QThread):
+    log_chunk = pyqtSignal(str)
+    status_changed = pyqtSignal(str, str)  # (mensagem, tipo: "running" | "ok" | "reboot" | "warn" | "error")
+    finished_execution = pyqtSignal(bool, bool)  # (sucesso_geral, reboot_necessario)
+
+    def __init__(self, mode: str, use_yay: bool):
+        super().__init__()
+        self.mode = mode  # "update" ou "check_only"
+        self.use_yay = use_yay
+        self._is_killed = False
+
+    def run(self):
+        if self.mode == "update":
+            self.run_full_update()
+        else:
+            self.run_check_only()
+
+    def _execute_in_pty(self, command_str: str) -> int:
+        """Executa um comando usando PTY para manter output interativo sem buffer."""
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            command_str,
+            shell=True,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            executable="/bin/bash"
+        )
+        os.close(slave)
+
+        while True:
+            if self._is_killed:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
+            r, _, _ = select.select([master], [], [], 0.1)
+            if r:
+                try:
+                    data = os.read(master, 2048)
+                    if not data:
+                        break
+                    decoded = data.decode("utf-8", errors="replace")
+                    self.log_chunk.emit(decoded)
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                # Esvazia qualquer byte residual
+                try:
+                    while True:
+                        r, _, _ = select.select([master], [], [], 0.05)
+                        if not r:
+                            break
+                        data = os.read(master, 2048)
+                        if not data:
+                            break
+                        self.log_chunk.emit(data.decode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+                break
+
+        os.close(master)
+        return proc.wait()
+
+    def run_full_update(self):
+        self.status_changed.emit("ATUALIZANDO REPOSITÓRIOS OFICIAIS...", "running")
+        self.log_chunk.emit("\n=== ETAPA 1/4: SINCRONIZAÇÃO E ATUALIZAÇÃO DO SISTEMA (PACMAN) ===\n")
+
+        pacman_cmd = "sudo pacman -Syu --noconfirm"
+        self.log_chunk.emit(f"Comando: {pacman_cmd}\n")
+        pacman_code = self._execute_in_pty(pacman_cmd)
+
+        aur_code = 0
+        if pacman_code != 0:
+            self.log_chunk.emit(f"\n❌ Falha na atualização dos repositórios oficiais (código {pacman_code}).\n")
+        else:
+            self.log_chunk.emit("\n✅ Repositórios oficiais atualizados com sucesso.\n")
+
+        if self.use_yay and shutil.which("yay"):
+            self.status_changed.emit("ATUALIZANDO PACOTES DO AUR...", "running")
+            self.log_chunk.emit("\n=== ETAPA 2/4: ATUALIZAÇÃO DO AUR (YAY -Sua) ===\n")
+            # MAKEFLAGS="-j4" previne exaustão de memória em pacotes de compilação pesada
+            aur_cmd = 'MAKEFLAGS="-j4" yay -Sua --noconfirm'
+            self.log_chunk.emit(f"Comando: {aur_cmd}\n")
+            aur_code = self._execute_in_pty(aur_cmd)
+
+            if aur_code != 0:
+                self.log_chunk.emit(f"\n⚠️ Falha ou erro na compilação do AUR (código {aur_code}).\n")
+                self.log_chunk.emit("O sistema base oficial permaneceu seguro e inalterado.\n")
+            else:
+                self.log_chunk.emit("\n✅ Pacotes do AUR atualizados com sucesso.\n")
+        else:
+            self.log_chunk.emit("\n=== ETAPA 2/4: AUR DESMARCADO / NÃO DISPONÍVEL ===\n")
+
+        if shutil.which("rkhunter"):
+            self.status_changed.emit("ATUALIZANDO BASE DO RKHUNTER...", "running")
+            self.log_chunk.emit("\n=== ETAPA 3/4: ATUALIZAÇÃO DA BASE DO RKHUNTER ===\n")
+            rkhunter_cmd = "sudo rkhunter --propupd"
+            self.log_chunk.emit(f"Comando: {rkhunter_cmd}\n")
+            rkhunter_code = self._execute_in_pty(rkhunter_cmd)
+            if rkhunter_code != 0:
+                self.log_chunk.emit(f"\n⚠️ Falha ao atualizar base do rkhunter (código {rkhunter_code}).\n")
+            else:
+                self.log_chunk.emit("\n✅ Base do rkhunter atualizada.\n")
+        else:
+            self.log_chunk.emit("\n=== ETAPA 3/4: RKHUNTER NÃO INSTALADO (IGNORADO) ===\n")
+
+        self.status_changed.emit("EXECUTANDO DIAGNÓSTICO (NEEDRESTART)...", "running")
+        self.log_chunk.emit("\n=== ETAPA 4/4: DIAGNÓSTICO DO KERNEL E SERVIÇOS (NEEDRESTART) ===\n")
+        reboot_needed, services = self.run_needrestart_diagnostics(emit_signals=False)
+
+        # Determina o status consolidado
+        if pacman_code != 0:
+            self.status_changed.emit("❌ ERRO NA BASE DO SISTEMA", "error")
+            self.finished_execution.emit(False, reboot_needed)
+        elif aur_code != 0:
+            if reboot_needed:
+                self.status_changed.emit("⚠️ REBOOT NECESSÁRIO (AVISO: AUR COM FALHA)", "reboot")
+            else:
+                self.status_changed.emit("⚠️ ATUALIZADO (AVISO: AUR COM FALHA)", "warn")
+            self.finished_execution.emit(True, reboot_needed)
+        elif reboot_needed:
+            self.status_changed.emit("⚠️ REBOOT NECESSÁRIO (KERNEL / MICROCODE ATUALIZADO)", "reboot")
+            self.finished_execution.emit(True, True)
+        elif services:
+            self.status_changed.emit("ℹ️ SERVIÇOS ANTIGOS NA RAM (REBOOT OPCIONAL)", "warn")
+            self.finished_execution.emit(True, False)
+        else:
+            self.status_changed.emit("✅ SISTEMA TOTALMENTE EM DIA (REBOOT NÃO NECESSÁRIO)", "ok")
+            self.finished_execution.emit(True, False)
+
+    def run_check_only(self):
+        self.status_changed.emit("EXECUTANDO DIAGNÓSTICO...", "running")
+        self.log_chunk.emit("\n=== VERIFICANDO ESTADO DOS SERVIÇOS E KERNEL (NEEDRESTART) ===\n")
+        self.run_needrestart_diagnostics(emit_signals=True)
+
+    def run_needrestart_diagnostics(self, emit_signals: bool = True):
+        # 1. Executa visual legível no log
+        cmd_readable = "sudo needrestart -r l < /dev/null"
+        self._execute_in_pty(cmd_readable)
+
+        # 2. Executa em batch para parsing determinístico
+        self.log_chunk.emit("\n--- Coletando parâmetros do kernel e microcódigo ---\n")
+        try:
+            batch_out = subprocess.check_output(["sudo", "needrestart", "-b"], text=True)
+        except Exception as e:
+            batch_out = ""
+            self.log_chunk.emit(f"Aviso ao ler needrestart -b: {e}\n")
+
+        ksta = 1
+        ucsta = 1
+        services_to_restart = []
+
+        for line in batch_out.splitlines():
+            line = line.strip()
+            if line.startswith("NEEDRESTART-KSTA:"):
+                try:
+                    ksta = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("NEEDRESTART-UCSTA:"):
+                try:
+                    ucsta = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("NEEDRESTART-SVC:"):
+                svc = line.split(":", 1)[1].strip()
+                if svc:
+                    services_to_restart.append(svc)
+
+        # Checagem secundária do Arch: diretório de módulos do kernel ativo
+        running_kernel = os.uname().release
+        modules_dir = f"/usr/lib/modules/{running_kernel}"
+        kernel_modules_missing = not os.path.exists(modules_dir)
+
+        reboot_needed = (ksta > 1) or (ucsta > 1) or kernel_modules_missing
+
+        self.log_chunk.emit(f"\n[DIAGNÓSTICO FINAL]\n")
+        self.log_chunk.emit(f"• Kernel em execução: {running_kernel}\n")
+        self.log_chunk.emit(f"• Status Kernel (needrestart): {'OBSOLETO / REQUER REBOOT' if ksta > 1 else 'Atualizado'}\n")
+        self.log_chunk.emit(f"• Módulos em disco: {'OK' if not kernel_modules_missing else 'REMOVIDOS / REBOOT OBRIGATÓRIO'}\n")
+        self.log_chunk.emit(f"• Status Microcode: {'OBSOLETO / REQUER REBOOT' if ucsta > 1 else 'Atualizado'}\n")
+
+        if services_to_restart:
+            self.log_chunk.emit(f"• Serviços com bibliotecas antigas: {', '.join(services_to_restart)}\n")
+
+        if emit_signals:
+            if reboot_needed:
+                self.status_changed.emit("⚠️ REBOOT NECESSÁRIO (KERNEL / MICROCODE ATUALIZADO)", "reboot")
+                self.finished_execution.emit(True, True)
+            elif services_to_restart:
+                self.status_changed.emit("ℹ️ SERVIÇOS ANTIGOS NA RAM (REBOOT OPCIONAL)", "warn")
+                self.finished_execution.emit(True, False)
+            else:
+                self.status_changed.emit("✅ SISTEMA TOTALMENTE EM DIA (REBOOT NÃO NECESSÁRIO)", "ok")
+                self.finished_execution.emit(True, False)
+
+        return reboot_needed, services_to_restart
+
+
+# ----------------------------------------------------------------------
+# Base de Conhecimento e Mapeamento de Ícones (Freedesktop & Arch)
+# ----------------------------------------------------------------------
+ARCHUPDATECHECKER_ICON_RULES = [
+    ("heroic-games-launcher", "heroic"),
+    ("obs-studio", "com.obsproject.Studio"),
+    ("vlc", "vlc"),
+    ("kpipewire", "speaker"),
+    ("blender", "blender"),
+    ("akonadi-calendar-tools", "view-calendar"),
+    ("akonadi-import-wizard", "kontact-import-wizard"),
+    ("angelfish", "org.kde.angelfish"),
+    ("steam", "steam"),
+    ("spotify", "spotify"),
+    ("code", "com.visualstudio.code"),
+    ("visual-studio-code", "com.visualstudio.code"),
+    ("linux", "preferences-system-linux"),
+    ("plasma", "kde-symbolic"),
+    ("wireplumber", "speaker"),
+    ("pipewire", "speaker"),
+    ("wayland", "preferences-desktop-display"),
+    ("nvidia", "cpu"),
+    ("intel", "cpu"),
+    ("amd", "cpu"),
+    ("mesa", "cpu"),
+    ("wine", "wine"),
+    ("proton", "wine"),
+    ("python", "pythonbackend"),
+    ("firefox", "firefox"),
+    ("lua", "luabackend"),
+    ("libreoffice", "libreoffice-startcenter"),
+    ("jre", "folder-java-symbolic"),
+    ("jdk", "folder-java-symbolic"),
+    ("openjdk", "folder-java-symbolic"),
+    ("ttf-", "font"),
+    ("xorg", "xorg"),
+    ("emacs", "emacs"),
+    ("vim", "gvim"),
+    ("neovim", "neovim"),
+    ("thunderbird", "org.mozilla.Thunderbird"),
+    ("perl", "application-x-perl"),
+    ("appimagelauncher", "AppImageLauncher"),
+    ("google", "im-google"),
+    ("telegram", "telegram"),
+    ("dropbox", "dropboxstatus-logo"),
+    ("kitty", "kitty"),
+    ("mlt", "applications-multimedia"),
+    ("sdl", "applications-games"),
+    ("uv", "application-x-executable"),
+    ("lib", "server-database"),
+]
+
+
+def resolve_pkg_icon(pkg_name: str) -> QIcon:
+    """Resolve o melhor ícone para o pacote usando tema Breeze, desktop files e regras do sistema."""
+    # 1. Nome direto no tema ativo
+    if QIcon.hasThemeIcon(pkg_name):
+        return QIcon.fromTheme(pkg_name)
+
+    # 2. Desktop file associado em /usr/share/applications/
+    candidates = (
+        glob.glob(f"/usr/share/applications/{pkg_name}.desktop") +
+        glob.glob(f"/usr/share/applications/*.{pkg_name}.desktop")
+    )
+    for c in candidates:
+        try:
+            with open(c, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("Icon="):
+                        ic_val = line.strip().split("=", 1)[1]
+                        if QIcon.hasThemeIcon(ic_val):
+                            return QIcon.fromTheme(ic_val)
+                        elif os.path.isfile(ic_val):
+                            return QIcon(ic_val)
+        except Exception:
+            pass
+
+    # 3. Regras de mapeamento especializadas
+    clean_name = pkg_name.lower()
+    if clean_name.startswith("lib32-"):
+        clean_name = clean_name[6:]
+    for key, ic_name in ARCHUPDATECHECKER_ICON_RULES:
+        if clean_name == key or clean_name.startswith(key):
+            if QIcon.hasThemeIcon(ic_name):
+                return QIcon.fromTheme(ic_name)
+
+    # 4. Fallbacks Freedesktop padrão do sistema
+    for fallback in ["apdatifier-package", "package-x-generic", "server-database", "system-software-update"]:
+        if QIcon.hasThemeIcon(fallback):
+            return QIcon.fromTheme(fallback)
+
+    return QIcon.fromTheme("system-software-update")
+
+
+def parse_package_line(line: str, source: str = "Oficial") -> dict:
+    """Extrai nome, versão anterior e nova versão da saída do checkupdates ou yay."""
+    line = line.strip()
+    m = re.match(r"^(\S+)\s+(\S+)\s+(?:->|→)\s+(\S+)", line)
+    if m:
+        return {
+            "name": m.group(1),
+            "old_ver": m.group(2),
+            "new_ver": m.group(3),
+            "source": source
+        }
+    parts = line.split()
+    if parts:
+        return {
+            "name": parts[0],
+            "old_ver": "",
+            "new_ver": "",
+            "source": source
+        }
+    return None
+
+
+def make_pkg_row_widget(pkg: dict, icon: QIcon) -> QWidget:
+    """Cria um card visual estilizado para exibição na lista de prévia de atualizações."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(10, 5, 10, 5)
+    h.setSpacing(12)
+
+    # Ícone do Pacote
+    icon_lbl = QLabel()
+    icon_lbl.setFixedSize(26, 26)
+    icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    pm = icon.pixmap(24, 24)
+    if not pm.isNull():
+        icon_lbl.setPixmap(pm)
+    h.addWidget(icon_lbl)
+
+    # Detalhes: Nome e Versões
+    info_box = QVBoxLayout()
+    info_box.setSpacing(1)
+
+    name_lbl = QLabel(pkg["name"])
+    name_lbl.setStyleSheet("font-weight: bold; color: #ffffff; font-size: 13px; font-family: monospace;")
+    info_box.addWidget(name_lbl)
+
+    if pkg["old_ver"] and pkg["new_ver"]:
+        ver_lbl = QLabel(f"{pkg['old_ver']}  →  {pkg['new_ver']}")
+        ver_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; font-family: monospace;")
+        info_box.addWidget(ver_lbl)
+
+    h.addLayout(info_box, stretch=1)
+
+    # Tag de Origem (Oficial vs AUR)
+    badge = QLabel(pkg.get("source", "Oficial"))
+    if pkg.get("source") == "AUR":
+        badge.setStyleSheet(f"""
+            background-color: {COLOR_YELLOW_BG};
+            color: {COLOR_YELLOW};
+            border: 1px solid #bb8009;
+            border-radius: 3px;
+            padding: 2px 7px;
+            font-size: 10px;
+            font-weight: bold;
+        """)
+    else:
+        badge.setStyleSheet(f"""
+            background-color: #162e4c;
+            color: #58a6ff;
+            border: 1px solid #1f6feb;
+            border-radius: 3px;
+            padding: 2px 7px;
+            font-size: 10px;
+            font-weight: bold;
+        """)
+    h.addWidget(badge)
+    return w
+
+
+# ----------------------------------------------------------------------
+# Thread de Checagem Leve em Segundo Plano (Sem Travar Pacman / Sem Sudo)
+# ----------------------------------------------------------------------
+class CheckUpdatesWorker(QThread):
+    check_finished = pyqtSignal(list, list, bool)  # (official_pkgs, aur_pkgs, reboot_needed)
+    check_failed = pyqtSignal(str)
+
+    def run(self):
+        official = []
+        aur = []
+        try:
+            # 1. Checagem de pacotes oficiais via checkupdates (seguro, não trava pacman db.lck)
+            if shutil.which("checkupdates"):
+                res = subprocess.run(
+                    ["checkupdates"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60
+                )
+                if res.returncode == 0 and res.stdout:
+                    for l in res.stdout.strip().splitlines():
+                        parsed = parse_package_line(l, "Oficial")
+                        if parsed:
+                            official.append(parsed)
+
+            # 2. Checagem de pacotes AUR via yay
+            if shutil.which("yay"):
+                res_aur = subprocess.run(
+                    ["yay", "-Qua"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60
+                )
+                if res_aur.returncode == 0 and res_aur.stdout:
+                    for l in res_aur.stdout.strip().splitlines():
+                        parsed = parse_package_line(l, "AUR")
+                        if parsed:
+                            aur.append(parsed)
+
+            # 3. Checagem instantânea de necessidade de reboot (módulos do kernel em execução)
+            running_kernel = os.uname().release
+            modules_missing = not os.path.exists(f"/usr/lib/modules/{running_kernel}")
+
+            self.check_finished.emit(official, aur, modules_missing)
+        except Exception as e:
+            self.check_failed.emit(str(e))
+
+
+def make_tray_icon(count: int = 0, reboot_needed: bool = False, checking: bool = False) -> QIcon:
+    """Gera um ícone dinâmico minimalista para a bandeja do sistema (Breeze / Arch)."""
+    base = QIcon.fromTheme("system-software-update")
+    if base.isNull() or not QIcon.hasThemeIcon("system-software-update"):
+        base = QIcon.fromTheme("update-none")
+
+    size = 48
+    pixmap = base.pixmap(size, size)
+    if pixmap.isNull():
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    if reboot_needed:
+        # Alerta Vermelho: Kernel ou Microcódigo desatualizado em RAM
+        badge_size = 20
+        badge_rect = QRectF(size - badge_size, size - badge_size, badge_size, badge_size)
+        painter.setBrush(QColor(COLOR_RED))
+        painter.setPen(QPen(QColor(BG_COLOR), 2))
+        painter.drawEllipse(badge_rect)
+        painter.setPen(QColor("#ffffff"))
+        font = QFont("sans-serif", 10, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "!")
+    elif count > 0:
+        # Alerta Amarelo/Âmbar: Quantidade de pacotes pendentes
+        txt = str(count) if count <= 99 else "99+"
+        badge_w = 20 if len(txt) <= 2 else 26
+        badge_h = 18
+        badge_rect = QRectF(size - badge_w, size - badge_h, badge_w, badge_h)
+        painter.setBrush(QColor(COLOR_YELLOW))
+        painter.setPen(QPen(QColor(BG_COLOR), 1.5))
+        painter.drawRoundedRect(badge_rect, 6, 6)
+        painter.setPen(QColor(BG_COLOR))
+        font = QFont("sans-serif", 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, txt)
+    elif checking:
+        # Ponto Ciano: Varredura em andamento
+        dot_size = 12
+        dot_rect = QRectF(size - dot_size, size - dot_size, dot_size, dot_size)
+        painter.setBrush(QColor(COLOR_CYAN))
+        painter.setPen(QPen(QColor(BG_COLOR), 1.5))
+        painter.drawEllipse(dot_rect)
+    else:
+        # Ponto Verde: Sistema 100% atualizado
+        dot_size = 12
+        dot_rect = QRectF(size - dot_size, size - dot_size, dot_size, dot_size)
+        painter.setBrush(QColor(COLOR_GREEN))
+        painter.setPen(QPen(QColor(BG_COLOR), 1.5))
+        painter.drawEllipse(dot_rect)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+# ----------------------------------------------------------------------
+# Janela Principal do Aplicativo (Painel Completo com Logs e Needrestart)
+# ----------------------------------------------------------------------
+class UpdateArchWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("UpdateArch — Arch Linux System & Reboot Guard")
+        self.resize(920, 640)
+        self.setMinimumSize(780, 520)
+
+        self.worker = None
+        self._updates_worker = None
+        self._is_quitting = False
+        self._hide_notification_shown = False
+        self._last_notified_count = -1
+
+        # Timer para diferenciar clique simples (menu) de duplo clique (janela completa)
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._on_single_click_timeout)
+
+        # Timer para manter as credenciais sudo ativas enquanto a janela estiver aberta
+        self.sudo_keepalive = QTimer(self)
+        self.sudo_keepalive.setInterval(60 * 1000)  # Cada 60 segundos
+        self.sudo_keepalive.timeout.connect(self._refresh_sudo)
+        self.sudo_keepalive.start()
+
+        # Timer periódico para checagem em segundo plano (a cada 60 minutos)
+        self.check_timer = QTimer(self)
+        self.check_timer.setInterval(60 * 60 * 1000)
+        self.check_timer.timeout.connect(self.trigger_background_check)
+        self.check_timer.start()
+
+        self._setup_ui()
+        self._apply_styles()
+        self._setup_tray()
+
+        # Dispara checagem inicial leve após 1.5s
+        QTimer.singleShot(1500, self.trigger_background_check)
+
+    def _refresh_sudo(self):
+        """Mantém a sessão sudo viva sem interrupções se a janela estiver visível."""
+        if self.isVisible():
+            subprocess.run(["sudo", "-n", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _setup_ui(self):
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(18, 18, 18, 18)
+        main_layout.setSpacing(14)
+
+        # 1. Header com Título, Hostname e Banner de Status
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(12)
+
+        info_box = QVBoxLayout()
+        info_box.setSpacing(2)
+        app_title = QLabel("UPDATEARCH GUARD")
+        app_title.setStyleSheet("font-size: 15px; font-weight: 800; letter-spacing: 1px; color: #ffffff;")
+        hostname_lbl = QLabel(f"Host: {os.uname().nodename}  |  Kernel: {os.uname().release}")
+        hostname_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED}; font-family: monospace;")
+        info_box.addWidget(app_title)
+        info_box.addWidget(hostname_lbl)
+        header_layout.addLayout(info_box)
+        header_layout.addStretch()
+
+        # Checkbox Yay (AUR)
+        self.chk_yay = QCheckBox("Incluir AUR (yay)")
+        self.chk_yay.setChecked(shutil.which("yay") is not None)
+        self.chk_yay.setEnabled(shutil.which("yay") is not None)
+        header_layout.addWidget(self.chk_yay)
+
+        main_layout.addLayout(header_layout)
+
+        # Banner de Status Dinâmico
+        self.status_banner = QLabel("PRONTO PARA VERIFICAR OU ATUALIZAR")
+        self.status_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_banner.setFixedHeight(42)
+        main_layout.addWidget(self.status_banner)
+
+        # 2. Painel Central com Splitter (Prévia dos Pacotes + Terminal Log)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background-color: {BORDER_COLOR};
+                height: 2px;
+                margin: 4px 0px;
+            }}
+        """)
+
+        # 2.A. Prévia dos Pacotes Pendentes com Ícones
+        preview_container = QWidget()
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+
+        preview_header = QHBoxLayout()
+        self.lbl_preview_title = QLabel("PACOTES PENDENTES PARA ATUALIZAÇÃO")
+        self.lbl_preview_title.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {TEXT_MUTED}; letter-spacing: 0.5px;")
+        preview_header.addWidget(self.lbl_preview_title)
+        preview_header.addStretch()
+        preview_layout.addLayout(preview_header)
+
+        self.pkg_list_view = QListWidget()
+        self.pkg_list_view.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {BG_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                border-bottom: 1px solid #1c2128;
+                padding: 2px;
+            }}
+            QListWidget::item:hover {{
+                background-color: {PANEL_COLOR};
+            }}
+        """)
+        preview_layout.addWidget(self.pkg_list_view)
+        splitter.addWidget(preview_container)
+
+        # 2.B. Terminal Log Embutido
+        terminal_container = QWidget()
+        terminal_layout = QVBoxLayout(terminal_container)
+        terminal_layout.setContentsMargins(0, 0, 0, 0)
+        terminal_layout.setSpacing(6)
+
+        terminal_header = QHBoxLayout()
+        lbl_terminal_title = QLabel("LOG DE EXECUÇÃO / AUDITORIA")
+        lbl_terminal_title.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {TEXT_MUTED}; letter-spacing: 0.5px;")
+        terminal_header.addWidget(lbl_terminal_title)
+        terminal_header.addStretch()
+        terminal_layout.addLayout(terminal_header)
+
+        self.terminal_view = QPlainTextEdit()
+        self.terminal_view.setReadOnly(True)
+        self.terminal_view.setMaximumBlockCount(10000)
+        mono_font = QFont("Noto Sans Mono", 9)
+        mono_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.terminal_view.setFont(mono_font)
+        terminal_layout.addWidget(self.terminal_view)
+        splitter.addWidget(terminal_container)
+
+        splitter.setSizes([200, 240])
+        main_layout.addWidget(splitter, stretch=1)
+
+        # 3. Barra Inferior de Ações e Botões
+        actions_layout = QHBoxLayout()
+        actions_layout.setSpacing(10)
+
+        self.btn_update = QPushButton("⚡ Atualizar Sistema")
+        self.btn_update.setFixedHeight(40)
+        self.btn_update.clicked.connect(self.on_start_update)
+        actions_layout.addWidget(self.btn_update)
+
+        self.btn_check = QPushButton("🔍 Apenas Checar (Needrestart)")
+        self.btn_check.setFixedHeight(40)
+        self.btn_check.clicked.connect(self.on_start_check)
+        actions_layout.addWidget(self.btn_check)
+
+        self.btn_clear = QPushButton("🧹 Limpar")
+        self.btn_clear.setFixedHeight(40)
+        self.btn_clear.setFixedWidth(80)
+        self.btn_clear.clicked.connect(self.terminal_view.clear)
+        actions_layout.addWidget(self.btn_clear)
+
+        actions_layout.addStretch()
+
+        # Botão de Reboot (Destaque)
+        self.btn_reboot = QPushButton("🔄 Reiniciar Sistema")
+        self.btn_reboot.setFixedHeight(40)
+        self.btn_reboot.clicked.connect(self.on_request_reboot)
+        actions_layout.addWidget(self.btn_reboot)
+
+        main_layout.addLayout(actions_layout)
+
+    def _apply_styles(self):
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {BG_COLOR};
+            }}
+            QWidget {{
+                color: {TEXT_COLOR};
+            }}
+            QCheckBox {{
+                color: {TEXT_COLOR};
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {BORDER_COLOR};
+                background: {PANEL_COLOR};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {COLOR_ARCH_BLUE};
+                border-color: {COLOR_ARCH_BLUE};
+            }}
+            QPlainTextEdit {{
+                background-color: {BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 10px;
+                line-height: 1.4;
+            }}
+            QPushButton {{
+                background-color: {PANEL_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {BORDER_COLOR};
+                color: #ffffff;
+            }}
+            QPushButton:disabled {{
+                background-color: {BG_COLOR};
+                color: {TEXT_MUTED};
+                border-color: {PANEL_COLOR};
+            }}
+        """)
+
+        # Estilo inicial do botão de atualizar (Destaque Arch Blue)
+        self.btn_update.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_ARCH_BLUE};
+                color: #ffffff;
+                border: 1px solid {COLOR_ARCH_BLUE};
+            }}
+            QPushButton:hover {{
+                background-color: {COLOR_ARCH_HOVER};
+            }}
+            QPushButton:disabled {{
+                background-color: {PANEL_COLOR};
+                color: {TEXT_MUTED};
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+
+        self._set_banner_state("PRONTO PARA VERIFICAR OU ATUALIZAR", "neutral")
+        self._set_reboot_button_highlight(False)
+
+    def _set_banner_state(self, text: str, state_type: str):
+        styles = {
+            "neutral": (PANEL_COLOR, TEXT_MUTED, BORDER_COLOR),
+            "running": (COLOR_YELLOW_BG, COLOR_YELLOW, COLOR_YELLOW),
+            "ok": (COLOR_GREEN_BG, COLOR_GREEN, COLOR_GREEN),
+            "warn": (COLOR_YELLOW_BG, COLOR_YELLOW, COLOR_YELLOW),
+            "reboot": (COLOR_RED_BG, COLOR_RED, COLOR_RED),
+            "error": (COLOR_RED_BG, COLOR_RED, COLOR_RED)
+        }
+        bg, fg, border = styles.get(state_type, styles["neutral"])
+        self.status_banner.setText(text)
+        self.status_banner.setStyleSheet(f"""
+            background-color: {bg};
+            color: {fg};
+            border: 1px solid {border};
+            border-radius: 4px;
+            font-weight: 800;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        """)
+
+    def _set_reboot_button_highlight(self, highlight: bool):
+        if highlight:
+            self.btn_reboot.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLOR_RED};
+                    color: #ffffff;
+                    border: 1px solid {COLOR_RED};
+                }}
+                QPushButton:hover {{
+                    background-color: #e03131;
+                }}
+            """)
+        else:
+            self.btn_reboot.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {PANEL_COLOR};
+                    color: {TEXT_COLOR};
+                    border: 1px solid {BORDER_COLOR};
+                }}
+                QPushButton:hover {{
+                    background-color: {BORDER_COLOR};
+                }}
+            """)
+
+    def append_log_text(self, text: str):
+        cleaned = clean_ansi(text)
+        self.terminal_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.terminal_view.insertPlainText(cleaned)
+        self.terminal_view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def set_controls_enabled(self, enabled: bool):
+        self.btn_update.setEnabled(enabled)
+        self.btn_check.setEnabled(enabled)
+        self.chk_yay.setEnabled(enabled and shutil.which("yay") is not None)
+
+    def on_start_update(self):
+        self.set_controls_enabled(False)
+        self._set_reboot_button_highlight(False)
+        self.worker = UpdateWorker(mode="update", use_yay=self.chk_yay.isChecked())
+        self.worker.log_chunk.connect(self.append_log_text)
+        self.worker.status_changed.connect(self._set_banner_state)
+        self.worker.finished_execution.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_start_check(self):
+        self.set_controls_enabled(False)
+        self._set_reboot_button_highlight(False)
+        self.worker = UpdateWorker(mode="check_only", use_yay=False)
+        self.worker.log_chunk.connect(self.append_log_text)
+        self.worker.status_changed.connect(self._set_banner_state)
+        self.worker.finished_execution.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_worker_finished(self, success: bool, reboot_needed: bool):
+        self.set_controls_enabled(True)
+        if reboot_needed:
+            self._set_reboot_button_highlight(True)
+        # Reavalia o status do sistema e atualiza os contadores da bandeja após 2 segundos
+        QTimer.singleShot(2000, self.trigger_background_check)
+
+    def on_request_reboot(self):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Confirmar Reinicialização")
+        msg_box.setText("Deseja realmente reiniciar o computador agora?")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setDefaultButton(QMessageBox.StandardButton.No)
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {BG_COLOR};
+                color: {TEXT_COLOR};
+            }}
+            QLabel {{
+                color: {TEXT_COLOR};
+            }}
+            QPushButton {{
+                background-color: {PANEL_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                padding: 6px 14px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {BORDER_COLOR};
+            }}
+        """)
+
+        if msg_box.exec() == QMessageBox.StandardButton.Yes:
+            self.append_log_text("\n[SISTEMA] Enviando sinal de reboot para o systemd...\n")
+            subprocess.run(["systemctl", "reboot"])
+
+    # ------------------------------------------------------------------
+    # Métodos de Integração com a Bandeja do Sistema (Tray Icon & Menu)
+    # ------------------------------------------------------------------
+    def show_and_activate(self):
+        """Exibe a janela, restaura do estado minimizado e traz para o foco."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quick_update_from_tray(self):
+        """Abre a janela em foco e dispara a atualização imediata."""
+        self.show_and_activate()
+        self.on_start_update()
+
+    def populate_preview_list(self, packages: list):
+        """Preenche o widget visual com cada pacote pendente, seu ícone resolvido e versões."""
+        self.pkg_list_view.clear()
+        if not packages:
+            self.lbl_preview_title.setText("PACOTES PENDENTES PARA ATUALIZAÇÃO (0)")
+            item = QListWidgetItem()
+            lbl = QLabel("✅ Sistema totalmente em dia. Nenhum pacote pendente de atualização.")
+            lbl.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 12px; padding: 14px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setSizeHint(lbl.sizeHint())
+            self.pkg_list_view.addItem(item)
+            self.pkg_list_view.setItemWidget(item, lbl)
+            return
+
+        self.lbl_preview_title.setText(f"PACOTES PENDENTES PARA ATUALIZAÇÃO ({len(packages)})")
+        for pkg in packages:
+            icon = resolve_pkg_icon(pkg["name"])
+            item = QListWidgetItem()
+            row_widget = make_pkg_row_widget(pkg, icon)
+            item.setSizeHint(row_widget.sizeHint())
+            self.pkg_list_view.addItem(item)
+            self.pkg_list_view.setItemWidget(item, row_widget)
+
+    def update_tray_menu(self, packages: list, reboot_needed: bool):
+        """Reconstrói dinamicamente o menu nativo da bandeja com a prévia direta dos pacotes, ícones e ações."""
+        tray_menu = QMenu(self)
+        tray_menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {PANEL_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                padding: 4px;
+                font-size: 12px;
+            }}
+            QMenu::item {{
+                padding: 6px 16px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: {COLOR_ARCH_BLUE};
+                color: #ffffff;
+            }}
+            QMenu::item:disabled {{
+                color: {TEXT_MUTED};
+                background-color: transparent;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background-color: {BORDER_COLOR};
+                margin: 4px 6px;
+            }}
+        """)
+
+        total = len(packages)
+
+        # 1. Alerta de Reinicialização (se aplicável)
+        if reboot_needed:
+            act_reboot_top = tray_menu.addAction(
+                QIcon.fromTheme("system-reboot"),
+                "⚠️ Kernel Atualizado — Reinicialização Necessária"
+            )
+            act_reboot_top.triggered.connect(self.on_request_reboot)
+            tray_menu.addSeparator()
+
+        # 2. Ação Principal e Prévia dos Pacotes Pendentes
+        if total > 0:
+            act_update_all = tray_menu.addAction(
+                QIcon.fromTheme("system-software-update"),
+                f"⚡ Atualizar Sistema ({total} pacotes pendentes)"
+            )
+            font = act_update_all.font()
+            font.setBold(True)
+            act_update_all.setFont(font)
+            act_update_all.triggered.connect(self.quick_update_from_tray)
+            tray_menu.addSeparator()
+
+            # Título da seção de pacotes
+            header_act = tray_menu.addAction(f"📦 Pacotes Pendentes ({total}):")
+            header_act.setEnabled(False)
+
+            # Lista individual dos pacotes com ícones (até 15 para conforto visual)
+            limit = 15
+            for pkg in packages[:limit]:
+                pkg_ic = resolve_pkg_icon(pkg["name"])
+                label = f"{pkg['name']}  ({pkg['old_ver']} → {pkg['new_ver']}) [{pkg['repo']}]"
+                act_pkg = tray_menu.addAction(pkg_ic, label)
+                act_pkg.triggered.connect(self.show_and_activate)
+
+            if total > limit:
+                more_act = tray_menu.addAction(
+                    QIcon.fromTheme("view-more-symbolic"),
+                    f"   ... e mais {total - limit} pacote(s) (abrir painel completo)"
+                )
+                more_act.triggered.connect(self.show_and_activate)
+        else:
+            act_ok = tray_menu.addAction(
+                QIcon.fromTheme("security-high"),
+                "✅ Sistema 100% atualizado"
+            )
+            act_ok.setEnabled(False)
+
+        tray_menu.addSeparator()
+
+        # 3. Controles Rápidos e Painel Completo
+        act_check = tray_menu.addAction(
+            QIcon.fromTheme("view-refresh"),
+            "🔍 Verificar Atualizações Agora"
+        )
+        act_check.triggered.connect(self.trigger_background_check)
+
+        act_panel = tray_menu.addAction(
+            QIcon.fromTheme("utilities-terminal"),
+            "💻 Abrir Painel Completo (Terminal & Logs)"
+        )
+        act_panel.triggered.connect(self.show_and_activate)
+
+        tray_menu.addSeparator()
+
+        act_reboot = tray_menu.addAction(
+            QIcon.fromTheme("system-reboot"),
+            "🔄 Reiniciar Sistema..."
+        )
+        act_reboot.triggered.connect(self.on_request_reboot)
+
+        tray_menu.addSeparator()
+
+        act_quit = tray_menu.addAction(
+            QIcon.fromTheme("application-exit"),
+            "❌ Sair do UpdateArch"
+        )
+        act_quit.triggered.connect(self.quit_application)
+
+        self.tray_icon.setContextMenu(tray_menu)
+
+    def _setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(make_tray_icon(count=0, reboot_needed=False))
+        self.tray_icon.setToolTip("UpdateArch Guard\nInicializando monitor...")
+        self.update_tray_menu([], False)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            # Duplo clique confirmado: cancela o timer de clique simples e abre a janela completa com logs
+            if self._click_timer.isActive():
+                self._click_timer.stop()
+            self.show_and_activate()
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
+            # Clique simples (botão esquerdo): aguarda breve intervalo para confirmar que não é duplo clique
+            self._click_timer.start(240)
+        elif reason == QSystemTrayIcon.ActivationReason.Context:
+            # Clique com botão direito: tratado nativamente pelo Plasma através do menu da bandeja
+            pass
+
+    def _on_single_click_timeout(self):
+        """Ao clicar uma vez no ícone com botão esquerdo: alterna visibilidade da janela principal ou abre menu."""
+        if self.isVisible():
+            self.hide()
+        else:
+            menu = self.tray_icon.contextMenu()
+            if menu:
+                try:
+                    menu.popup(QCursor.pos())
+                except Exception:
+                    self.show_and_activate()
+            else:
+                self.show_and_activate()
+
+    def trigger_background_check(self):
+        if self._updates_worker and self._updates_worker.isRunning():
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.tray_icon.setIcon(make_tray_icon(checking=True))
+        self.tray_icon.setToolTip("UpdateArch Guard\nVerificando atualizações em segundo plano...")
+
+        self._updates_worker = CheckUpdatesWorker()
+        self._updates_worker.check_finished.connect(self.on_background_check_finished)
+        self._updates_worker.check_failed.connect(self.on_background_check_failed)
+        self._updates_worker.start()
+
+    def on_background_check_finished(self, official: list, aur: list, reboot_needed: bool):
+        all_pkgs = official + aur
+        total = len(all_pkgs)
+        self.tray_icon.setIcon(make_tray_icon(count=total, reboot_needed=reboot_needed))
+
+        # Atualiza a prévia visual na janela completa e no menu nativo do tray
+        self.populate_preview_list(all_pkgs)
+        self.update_tray_menu(all_pkgs, reboot_needed)
+
+        if reboot_needed:
+            tip = f"UpdateArch Guard\n⚠️ Kernel atualizado! Reinicialização necessária.\nPacotes pendentes: {total}\n• Botão direito: menu rápido\n• Duplo clique: painel completo"
+            self._set_banner_state("⚠️ REBOOT NECESSÁRIO (KERNEL / MICROCODE ATUALIZADO)", "reboot")
+            self._set_reboot_button_highlight(True)
+        elif total > 0:
+            tip = f"UpdateArch Guard\n{total} atualização(ões) pendente(s):\n• {len(official)} oficial(is)\n• {len(aur)} AUR\n• Botão direito: menu rápido com lista e atualização\n• Duplo clique: logs do terminal"
+            if not (self.worker and self.worker.isRunning()):
+                self._set_banner_state(f"{total} ATUALIZAÇÃO(ÕES) DISPONÍVEIS ({len(official)} PACMAN, {len(aur)} AUR)", "warn")
+        else:
+            tip = "UpdateArch Guard\n✅ Sistema totalmente em dia\n• Botão direito: menu rápido\n• Duplo clique: painel de logs"
+            if not (self.worker and self.worker.isRunning()):
+                self._set_banner_state("SISTEMA TOTALMENTE EM DIA", "ok")
+
+        self.tray_icon.setToolTip(tip)
+
+        # Notificação nativa na área de notificação
+        if reboot_needed:
+            self.tray_icon.showMessage(
+                "UpdateArch — Reinicialização Pendente",
+                "O Kernel ou módulos em RAM foram substituídos. Reinicie o sistema.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                6000
+            )
+        elif total > 0 and total != self._last_notified_count:
+            resumo = f"{total} atualizações disponíveis ({len(official)} oficiais, {len(aur)} AUR)."
+            self.tray_icon.showMessage(
+                "UpdateArch — Atualizações do Arch",
+                resumo,
+                QSystemTrayIcon.MessageIcon.Information,
+                5000
+            )
+            self._last_notified_count = total
+        elif total == 0:
+            self._last_notified_count = 0
+
+    def on_background_check_failed(self, err_msg: str):
+        self.tray_icon.setIcon(make_tray_icon(count=0, reboot_needed=False))
+        self.tray_icon.setToolTip(f"UpdateArch Guard\nErro na verificação: {err_msg}")
+        self.populate_preview_list([])
+        self.update_tray_menu([], False)
+
+    def closeEvent(self, event):
+        """Ao clicar no X da janela, minimiza para o System Tray em vez de finalizar o processo."""
+        if self._is_quitting:
+            event.accept()
+        else:
+            event.ignore()
+            self.hide()
+            if not self._hide_notification_shown and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "UpdateArch Guard",
+                    "O aplicativo continua em execução na bandeja do sistema.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
+                self._hide_notification_shown = True
+
+    def quit_application(self):
+        """Encerra definitivamente o aplicativo e o ícone de bandeja."""
+        self._is_quitting = True
+        if self.worker and self.worker.isRunning():
+            self.worker._is_killed = True
+            self.worker.wait(1000)
+        self.tray_icon.hide()
+        QApplication.quit()
+
+
+# ----------------------------------------------------------------------
+# Ponto de Entrada com Suporte a Instância Única e Flag --tray
+# ----------------------------------------------------------------------
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    socket_name = f"updatearch_{os.getuid()}"
+
+    # 1. Checagem de Instância Única via QLocalSocket
+    client_socket = QLocalSocket()
+    client_socket.connectToServer(socket_name)
+    if client_socket.waitForConnected(400):
+        # Outra instância já está ativa: solicita exibição e encerra o novo processo
+        client_socket.write(b"show\n")
+        client_socket.waitForBytesWritten(400)
+        client_socket.disconnectFromServer()
+        sys.exit(0)
+
+    # 2. Inicialização da Instância Principal
+    window = UpdateArchWindow()
+
+    # 3. Servidor Local para responder a novas chamadas do usuário
+    local_server = QLocalServer()
+    local_server.removeServer(socket_name)
+    if local_server.listen(socket_name):
+        def handle_new_connection():
+            conn = local_server.nextPendingConnection()
+            if conn:
+                def read_cmd():
+                    data = conn.readAll().data().decode("utf-8", errors="ignore").strip()
+                    if data == "show":
+                        window.show_and_activate()
+                conn.readyRead.connect(read_cmd)
+        local_server.newConnection.connect(handle_new_connection)
+
+    # 4. Modo de exibição: Inicia minimizado no Tray se passado --tray ou -t
+    start_in_tray = "--tray" in sys.argv or "-t" in sys.argv
+    if not start_in_tray:
+        window.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

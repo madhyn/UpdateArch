@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=UpdateArch
+Comment=Arch Linux System & Reboot Guard (Tray Daemon)
+Exec=updatearch --tray
+Icon=system-software-update
+Terminal=false
+Type=Application
+Categories=System;Settings;Utility;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

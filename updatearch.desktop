@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=UpdateArch
+Comment=Arch Linux System & Reboot Guard
+Exec=updatearch
+Icon=system-software-update
+Terminal=false
+Type=Application
+Categories=System;Settings;Utility;
+Keywords=arch;pacman;yay;update;upgrade;kernel;reboot;
+StartupNotify=false
