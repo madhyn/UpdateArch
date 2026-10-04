@@ -1,0 +1,17 @@
+pkgbase = updatearch
+	pkgdesc = Autonomous System Tray & Update Guard for Arch Linux with native Wayland/SNI integration
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/madhyn/UpdateArch
+	arch = any
+	license = MIT
+	depends = python
+	depends = python-pyqt6
+	depends = pacman-contrib
+	optdepends = yay: Support for Arch User Repository (AUR) packages
+	optdepends = needrestart: Kernel, microcode and shared library restart diagnostics
+	optdepends = rkhunter: Security audit and tool definition updates
+	source = updatearch-1.0.0.tar.gz::https://github.com/madhyn/UpdateArch/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = 2822ba361353a2e3b4f4a5feffc5a7762f7d86b02b87001fb36dcc3f5b96fe5f
+
+pkgname = updatearch
